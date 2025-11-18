@@ -1,0 +1,75 @@
+paths:
+  input_dir: "/Volumes/IshaVerbat/Isha/TCR/All_Emerson_Cohort01"
+  output_dir: "/Volumes/IshaVerbat/Isha/TCR/clono-scan/Paraquets_All_Emerson_Cohort01"
+  # Optional: path to external meta csv, or set to null
+  external_metadata: null
+
+parsing:
+  file_extension: "P00002.tsv"
+  chunk_size: 10000
+  sample_id_regex: "(Patient_[A-Z0-9]+)"
+
+columns:
+  # Columns strictly required to be kept
+  keep:
+    - "sample_catalog_tags"
+    - "total_templates"
+    - "productive_templates"
+    - "total_rearrangements"
+    - "total_reads"
+    - "total_productive_reads"
+    - "sample_amount_ng"
+    - "sample_cells_mass_estimate"
+    - "rearrangement"
+    - "amino_acid"
+    - "templates"
+    - "seq_reads"
+    - "frequency"
+    - "productive_frequency"
+    - "cdr3_length"
+    - "v_resolved"
+    - "d_resolved"
+    - "j_resolved"
+    - "v_deletions"
+    - "d5_deletions"
+    - "d3_deletions"
+    - "j_deletions"
+    - "n2_insertions"
+    - "n1_insertions"
+    - "v_index"
+    - "n1_index"
+    - "n2_index"
+    - "d_index"
+    - "j_index"
+
+  # Map old names to new names
+  rename_map:
+    "v_resolved": "v_call"
+    "d_resolved": "d_call"
+    "j_resolved": "j_call"
+    "amino_acid": "junction_aa"
+    "rearrangement": "sequence"
+    # Metadata columns
+    "Biological Sex": "sex"
+    "Age (Range)": "age_range"
+    "Tissue Source": "tissue"
+    "Racial Group": "race"
+    "Virus Diseases": "virus_diseases"
+
+metadata_parsing:
+  col_name: "sample_catalog_tags"
+  delimiter: ","
+  kv_sep: ":"
+
+types:
+  # Columns to convert to categorical to save memory.
+  # MUST use the NEW names defined in rename_map above.
+  categoricals:
+    - "v_call"
+    - "j_call"
+    - "d_call"
+    - "sex"
+    - "tissue"
+    - "race"
+    - "age_range"
+    - "virus_diseases"

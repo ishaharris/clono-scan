@@ -1,99 +1,116 @@
 import pandas as pd
 import os
 import glob
-import re
+import yaml 
+from collections import defaultdict
 
 class RepertoirePipeline:
-    def __init__(self, input_dir, output_dir):
-        self.input_dir = input_dir
-        self.output_dir = output_dir
-        
-        # 1. CONFIGURATION
-        # Columns strictly required for immune analysis
-        self.seq_cols = [
-            'nucleotide', 'aminoAcid', 'count (reads)', 
-            'frequencyCount (%)', 'vGeneName', 'jGeneName'
-        ]
-        
-        # If metadata exists inside the TSV, map it to a standard name here
-        # Format: {'Old_Name_In_TSV': 'New_Standard_Name'}
-        self.internal_meta_map = {
-            'sample_tags': 'clinical_tag',
-            'guest_lab_id': 'lab_id'
-        }
+    def __init__(self, config_path):
+        with open(config_path, 'r') as file:
+            self.config = yaml.safe_load(file)
+            
+        self.input_dir = self.config['paths']['input_dir']
+        self.output_dir = self.config['paths']['output_dir']
 
     def extract_sample_id(self, filename):
-        # CUSTOMIZE THIS: Regex to pull ID from filename
-        # Example: "2023_05_Patient_A12_TCR.tsv" -> "Patient_A12"
-        match = re.search(r'(Patient_[A-Z0-9]+)', filename)
-        if match:
-            return match.group(1)
-        return os.path.splitext(filename)[0] # Fallback to whole filename
+        return os.path.splitext(filename)[0]
 
-    def process_files(self, external_metadata_path=None):
-        # Load external metadata if provided
-        meta_df = None
-        if external_metadata_path:
-            meta_df = pd.read_csv(external_metadata_path)
-            # Ensure sample_id is string for merging
-            meta_df['sample_id'] = meta_df['sample_id'].astype(str)
-
-        files = glob.glob(os.path.join(self.input_dir, '*.tsv'))
+    def process_files(self):
+        # 1. Find Files
+        file_pattern = self.config['parsing']['file_extension']
+        files = glob.glob(os.path.join(self.input_dir, file_pattern))
         
-        print(f"Processing {len(files)} files...")
+        print(f"Found {len(files)} files in {self.input_dir}...")
 
+        # 2. Process Each File
         for file_path in files:
             filename = os.path.basename(file_path)
             sample_id = self.extract_sample_id(filename)
             
-            # 1. Read TSV (Sequence columns + potential internal metadata columns)
-            # We read slightly more columns than we need to check for internal metadata
+            print(f"\nProcessing: {filename} -> ID: {sample_id}")
+            
+            # --- Initialize counters for progress tracking ---
+            total_rows_processed = 0 
+            report_interval = 20000 
+            # --- End counters ---
+            
             try:
-                # Read only necessary columns to save memory
-                # We assume the standard cols exist, plus we check for mapped cols
-                df_iter = pd.read_csv(file_path, sep='\t', chunksize=10000)
+                chunk_size = self.config['parsing']['chunk_size']
+                df_iter = pd.read_csv(file_path, sep='\t', chunksize=chunk_size)
                 
+                chunk_counter = 0
                 for chunk in df_iter:
-                    # Keep only sequence cols that exist in this file
-                    valid_seq_cols = [c for c in self.seq_cols if c in chunk.columns]
-                    df_clean = chunk[valid_seq_cols].copy()
                     
-                    # 2. HANDLE METADATA INSIDE TSV
-                    for tsv_col, std_col in self.internal_meta_map.items():
-                        if tsv_col in chunk.columns:
-                            # Renaming to standard name
-                            df_clean[std_col] = chunk[tsv_col]
+                    # --- PROGRESS CHECK ---
+                    total_rows_processed += len(chunk)
+                    if total_rows_processed % report_interval < chunk_size:
+                        print(f" Rows processed for {sample_id}: {total_rows_processed:,}")
+                    # --- END PROGRESS CHECK ---
                     
-                    # 3. INJECT SAMPLE ID (The Link Key)
-                    df_clean['sample_id'] = sample_id
-                    
-                    # 4. OPTIONAL: INJECT EXTERNAL METADATA
-                    # Only do this if you want "Baked In" metadata. 
-                    # Usually, it is better to join later (see next section).
-                    if meta_df is not None:
-                        # Merge specific row metadata if needed
-                        pass 
+                    # A. Determine Columns to Load
+                    cols_to_use = self.config['columns']['keep'].copy()
+                    meta_config = self.config['metadata_parsing']
+                    meta_col = meta_config['col_name']
+                    if meta_col not in cols_to_use:
+                        cols_to_use.append(meta_col)
 
-                    # 5. OPTIMIZE TYPES
-                    cats = ['vGeneName', 'jGeneName', 'aminoAcid']
-                    for c in cats:
+                    valid_cols = [c for c in cols_to_use if c in chunk.columns]
+                    df_clean = chunk[valid_cols].copy()
+                    
+                    # B. Inject Sample ID
+                    df_clean['sample_id'] = sample_id
+
+                    # C. Parse The Long Metadata String
+                    if meta_col in df_clean.columns:
+                        tag_string = df_clean[meta_col].iloc[0]
+                        
+                        if pd.notna(tag_string) and isinstance(tag_string, str):
+                            delimiter = meta_config['delimiter']
+                            kv_sep = meta_config['kv_sep']
+                            
+                            parsed_data = defaultdict(list)
+                            items = tag_string.split(delimiter)
+                            
+                            for item in items:
+                                if kv_sep in item:
+                                    key, val = item.split(kv_sep, 1)
+                                    k_clean, v_clean = key.strip(), val.strip()
+                                    if k_clean and v_clean:
+                                        parsed_data[k_clean].append(v_clean)
+                            
+                            for k, v_list in parsed_data.items():
+                                df_clean[k] = "; ".join(v_list)
+
+                        df_clean.drop(columns=[meta_col], inplace=True)
+
+                    # D. Rename Columns (Standardize)
+                    rename_map = self.config['columns'].get('rename_map', {})
+                    if rename_map:
+                        df_clean.rename(columns=rename_map, inplace=True)
+
+                    # E. Optimize Types (Categoricals)
+                    cat_cols = self.config['types']['categoricals']
+                    for c in cat_cols:
                         if c in df_clean.columns:
                             df_clean[c] = df_clean[c].astype('category')
 
-                    # 6. SAVE TO PARQUET (Partitioned by Sample ID)
-                    # Partitioning by ID makes it easy to grab specific patients later
+                    # F. Save to Parquet
                     save_path = os.path.join(self.output_dir, f"sample_id={sample_id}")
                     os.makedirs(save_path, exist_ok=True)
                     
-                    # We append chunks to the partition
-                    output_file = os.path.join(save_path, f"{filename.replace('.tsv','')}.parquet")
-                    df_clean.to_parquet(output_file, index=False)
+                    base_name = os.path.splitext(filename)[0]
+                    output_file = os.path.join(save_path, f"{base_name}_part{chunk_counter}.parquet")
+                    
+                    df_clean.to_parquet(output_file, index=False, engine='pyarrow')
+                    chunk_counter += 1
             
             except Exception as e:
                 print(f"Error processing {filename}: {e}")
+                
+            print(f"File {sample_id} processing complete. Total rows: {total_rows_processed:,}")
 
-        print("Pipeline Finished.")
+        print("\nPipeline Finished.")
 
-# --- RUNNING IT ---
-pipeline = RepertoirePipeline(input_dir='raw_data/', output_dir='processed_dataset/')
-pipeline.process_files() # Run without external meta to keep it clean
+if __name__ == "__main__":
+    pipeline = RepertoirePipeline("config.yaml") 
+    pipeline.process_files()

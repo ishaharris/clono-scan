@@ -1,0 +1,6 @@
+# 1. DATA 
+data/
+
+# 2. PYTHON COMPILE/CACHE ARTIFACTS
+__pycache__/
+*.pyc

@@ -13,6 +13,7 @@ class RepertoirePipeline:
         self.output_dir = self.config['paths']['output_dir']
 
     def extract_sample_id(self, filename):
+        # Logic to get ID from filename
         return os.path.splitext(filename)[0]
 
     def process_files(self):
@@ -27,16 +28,28 @@ class RepertoirePipeline:
             filename = os.path.basename(file_path)
             sample_id = self.extract_sample_id(filename)
             
+            # --- NEW: Logic to check and skip ---
+            # Define the expected output path for this sample
+            save_path = os.path.join(self.output_dir, f"sample_id={sample_id}")
+            
+            # Check if it exists
+            if os.path.exists(save_path):
+                print(f"Skipping: {filename} (Output folder {save_path} already exists)")
+                continue
+            # ------------------------------------
+            
             print(f"\nProcessing: {filename} -> ID: {sample_id}")
             
             # --- Initialize counters for progress tracking ---
             total_rows_processed = 0 
             report_interval = 20000 
-            # --- End counters ---
             
             try:
                 chunk_size = self.config['parsing']['chunk_size']
                 df_iter = pd.read_csv(file_path, sep='\t', chunksize=chunk_size)
+                
+                # Create the directory now that we know we need to write to it
+                os.makedirs(save_path, exist_ok=True)
                 
                 chunk_counter = 0
                 for chunk in df_iter:
@@ -45,7 +58,6 @@ class RepertoirePipeline:
                     total_rows_processed += len(chunk)
                     if total_rows_processed % report_interval < chunk_size:
                         print(f" Rows processed for {sample_id}: {total_rows_processed:,}")
-                    # --- END PROGRESS CHECK ---
                     
                     # A. Determine Columns to Load
                     cols_to_use = self.config['columns']['keep'].copy()
@@ -95,9 +107,6 @@ class RepertoirePipeline:
                             df_clean[c] = df_clean[c].astype('category')
 
                     # F. Save to Parquet
-                    save_path = os.path.join(self.output_dir, f"sample_id={sample_id}")
-                    os.makedirs(save_path, exist_ok=True)
-                    
                     base_name = os.path.splitext(filename)[0]
                     output_file = os.path.join(save_path, f"{base_name}_part{chunk_counter}.parquet")
                     
@@ -106,6 +115,9 @@ class RepertoirePipeline:
             
             except Exception as e:
                 print(f"Error processing {filename}: {e}")
+                # Optional: Remove the folder if processing failed so it retries next time
+                # import shutil
+                # if os.path.exists(save_path): shutil.rmtree(save_path)
                 
             print(f"File {sample_id} processing complete. Total rows: {total_rows_processed:,}")
 

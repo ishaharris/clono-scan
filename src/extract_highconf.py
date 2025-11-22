@@ -43,7 +43,6 @@ def process_row(row, config):
     processing_cfg = config['processing']
     
     # --- GET DELIMITERS ---
-    # Default to semicolon/comma if missing from config, but ideally provided in yaml
     j_delim = processing_cfg.get('junction_delimiter', ';')
     g_delim = processing_cfg.get('gene_delimiter', ',')
     prefixes = processing_cfg.get('strip_prefixes', [])
@@ -60,7 +59,6 @@ def process_row(row, config):
     j_list = [x.strip() for x in raw_j.split(g_delim) if x.strip()]
 
     # 3. Select Genes (Keep first incident only)
-    # Logic: Find first V containing "TRBV", else take the absolute first item.
     selected_v = next((v for v in v_list if "TRBV" in v), None)
     if not selected_v and v_list:
         selected_v = v_list[0]
@@ -72,7 +70,10 @@ def process_row(row, config):
     aa_list = [x.strip() for x in raw_aa.split(j_delim) if x.strip()]
     
     results = []
-    val_positive = row[cols['positive']] if pd.notna(row[cols['positive']]) else 0
+    
+    # Retrieve the pre-calculated sum (dextramer_count)
+    # We default to 0 if the column didn't calculate correctly for some reason
+    val_count = row['dextramer_count'] if pd.notna(row['dextramer_count']) else 0
 
     for aa in aa_list:
         # --- FILTER: DROP TRA ---
@@ -88,7 +89,7 @@ def process_row(row, config):
                 'v_call': selected_v,
                 'd_call': selected_d,
                 'j_call': selected_j,
-                'positive': val_positive
+                'dextramer_count': val_count  # Renamed from 'positive'
             })
             
     return results
@@ -102,19 +103,43 @@ def process_tcr_data(input_file, output_file, config):
         logger.error(f"Failed to read file: {e}")
         sys.exit(1)
 
-    # Filter Rows (Thresholds)
-    n = config['filtering']['threshold']
+    # --- FILTERING LOGIC ---
+    # Hardcoding threshold to 10 as requested, or use config if needed
+    # n = config['filtering']['threshold'] 
+    n = 10 
+    
+    # Identify the relevant columns
     high_cols = identify_columns(cm, config['filtering'].get('high_count_criteria'))
     low_cols = identify_columns(cm, config['filtering'].get('low_count_criteria'))
 
-    if high_cols or low_cols:
-        mask_high = (cm[high_cols] > n).all(axis=1) if high_cols else pd.Series(True, index=cm.index)
-        mask_low = (cm[low_cols] <= n).all(axis=1) if low_cols else pd.Series(True, index=cm.index)
-        cm_filtered = cm[mask_high & mask_low].copy()
-        logger.info(f"Filtered rows based on counts: {len(cm)} -> {len(cm_filtered)}")
+    if high_cols:
+        # Logic: BOTH (all identified) columns must be > 10
+        mask_high = (cm[high_cols] > n).all(axis=1)
+        logger.info(f"Columns used for Dextramer/Positive check: {high_cols}")
     else:
-        cm_filtered = cm.copy()
+        mask_high = pd.Series(True, index=cm.index)
+
+    if low_cols:
+        mask_low = (cm[low_cols] <= n).all(axis=1)
+    else:
+        mask_low = pd.Series(True, index=cm.index)
+
+    cm_filtered = cm[mask_high & mask_low].copy()
+    logger.info(f"Filtered rows (Threshold > {n}): {len(cm)} -> {len(cm_filtered)}")
     
+    # --- CALCULATE SUM ---
+    # Calculate the 'dextramer_count' by summing the high_count columns
+    if high_cols:
+        cm_filtered['dextramer_count'] = cm_filtered[high_cols].sum(axis=1)
+    else:
+        # Fallback if no high columns defined, checks strictly for a 'positive' col in config
+        pos_col = config['columns'].get('positive')
+        if pos_col and pos_col in cm_filtered.columns:
+            cm_filtered['dextramer_count'] = cm_filtered[pos_col]
+        else:
+            cm_filtered['dextramer_count'] = 0
+            logger.warning("No columns found to sum for dextramer_count. Setting to 0.")
+
     # Explode Logic
     logger.info("Exploding TRB chains...")
     exploded_data = []
@@ -131,7 +156,7 @@ def process_tcr_data(input_file, output_file, config):
     logger.info("Aggregating by unique Junction AA...")
     
     agg_rules = {
-        'positive': 'sum',
+        'dextramer_count': 'sum', # Aggregating the new column
         'v_call': 'first', 
         'd_call': 'first',
         'j_call': 'first'
@@ -141,13 +166,13 @@ def process_tcr_data(input_file, output_file, config):
     df_grouped = df_exploded.groupby('junction_aa').agg(agg_rules).reset_index()
 
     # Sort by count descending (Most abundant first)
-    df_final = df_grouped.sort_values(by='positive', ascending=False).copy()
+    df_final = df_grouped.sort_values(by='dextramer_count', ascending=False).copy()
     
     # --- NEW: Add ID Column (1 to n) ---
     df_final.insert(0, 'id', range(1, 1 + len(df_final)))
 
     # Final Column Selection
-    cols_to_save = ['id', 'junction_aa', 'positive', 'v_call', 'd_call', 'j_call']
+    cols_to_save = ['id', 'junction_aa', 'dextramer_count', 'v_call', 'd_call', 'j_call']
     df_final = df_final[cols_to_save]
 
     output_path = Path(output_file)

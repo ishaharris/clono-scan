@@ -1,9 +1,9 @@
 filtering:
   threshold: 10
   high_count_criteria:
-    exact: ["positive"] 
+    exact: ['YLQPRTFLL_R1', 'YLQPRTFLL_R2']
   low_count_criteria:
-    startswith: ["peptide"]
+    startswith: []
 
 columns:
   junction: "junction"
@@ -11,7 +11,6 @@ columns:
   v_call: "v_call"
   d_call: "d_call"
   j_call: "j_call"
-  positive: "positive"
 
 processing:
   junction_delimiter: ";"

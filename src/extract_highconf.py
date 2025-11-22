@@ -28,104 +28,67 @@ def identify_columns(df, criteria):
             found_cols.update([c for c in df.columns if c.startswith(prefix)])
     return list(found_cols)
 
-def apply_alignment_rules(seqs, attributes, tag="Attribute"):
+def clean_sequence(seq, prefixes_to_strip):
     """
-    Strictly aligns attribute lists (AA, V, D, J) to the anchor Nucleotide list.
+    Basic cleanup: remove whitespace and specific prefixes (e.g., 'TRB:').
     """
-    n_s = len(seqs)
-    n_a = len(attributes)
-
-    if n_s == 0: return []
-
-    # Rule 1: Perfect Match (2 NT, 2 AA) -> Keep order 1:1
-    if n_s == n_a:
-        return attributes
-
-    # Rule 2: 2 NT, 1 Attribute -> Duplicate Attribute to both NTs
-    # (e.g. 2 RNA reads, but only 1 V-call assigned by software)
-    if n_s == 2 and n_a == 1:
-        return [attributes[0], attributes[0]]
-    
-    # Rule 3: 1 NT, 2 Attributes -> Take First Attribute
-    if n_s == 1 and n_a == 2:
-        return [attributes[0]]
-
-    # Edge Case: Mismatch lengths (e.g. 3 NT, 2 AA) -> Pad with None
-    if n_s > n_a:
-        return attributes + [None] * (n_s - n_a)
-    else:
-        return attributes[:n_s]
-
-def clean_aa_sequence(aa_str, prefixes_to_strip):
-    """
-    Removes prefixes like 'TRB:' from amino acid strings.
-    Input: 'TRB:CAS...  ' -> Output: 'CAS...'
-    """
-    if not aa_str: return ""
-    clean = aa_str.strip()
+    if not seq: return ""
+    clean = str(seq).strip()
     for prefix in prefixes_to_strip:
         clean = clean.replace(prefix, '')
     return clean.strip()
 
 def process_row(row, config):
-    """
-    Extracts parallel lists and iterates by Index to ensure NT/AA coupling.
-    """
     cols = config['columns']
-    delim = config['processing']['delimiter']
+    processing_cfg = config['processing']
     
-    # 1. Safe String Extraction
-    raw_nt = str(row[cols['junction']]) if pd.notna(row[cols['junction']]) else ""
+    # --- GET DELIMITERS ---
+    # Default to semicolon/comma if missing from config, but ideally provided in yaml
+    j_delim = processing_cfg.get('junction_delimiter', ';')
+    g_delim = processing_cfg.get('gene_delimiter', ',')
+    prefixes = processing_cfg.get('strip_prefixes', [])
+
+    # 1. Get raw strings
     raw_aa = str(row[cols['junction_aa']]) if pd.notna(row[cols['junction_aa']]) else ""
     raw_v = str(row[cols['v_call']]) if pd.notna(row[cols['v_call']]) else ""
     raw_d = str(row[cols['d_call']]) if pd.notna(row[cols['d_call']]) else ""
     raw_j = str(row[cols['j_call']]) if pd.notna(row[cols['j_call']]) else ""
     
-    # 2. Split into Lists (Preserving Order)
-    nt_list = [x.strip() for x in raw_nt.split(delim) if x.strip()]
+    # 2. Split Gene Columns using gene_delimiter
+    v_list = [x.strip() for x in raw_v.split(g_delim) if x.strip()]
+    d_list = [x.strip() for x in raw_d.split(g_delim) if x.strip()]
+    j_list = [x.strip() for x in raw_j.split(g_delim) if x.strip()]
+
+    # 3. Select Genes (Keep first incident only)
+    # Logic: Find first V containing "TRBV", else take the absolute first item.
+    selected_v = next((v for v in v_list if "TRBV" in v), None)
+    if not selected_v and v_list:
+        selected_v = v_list[0]
+
+    selected_d = d_list[0] if d_list else ""
+    selected_j = j_list[0] if j_list else ""
+
+    # 4. Split Junction AA using junction_delimiter
+    aa_list = [x.strip() for x in raw_aa.split(j_delim) if x.strip()]
     
-    # If no junction, skip row
-    if not nt_list: return []
-
-    # 3. Handle AA Cleaning
-    # Split first, THEN clean specific items. 
-    # Example: "TRA:AAA; TRB:BBB" -> ["TRA:AAA", "TRB:BBB"] -> ["AAA", "BBB"]
-    aa_dirty = [x.strip() for x in raw_aa.split(delim) if x.strip()]
-    aa_list = [clean_aa_sequence(x, config['processing'].get('strip_prefixes', [])) for x in aa_dirty]
-
-    v_list = [x.strip() for x in raw_v.split(delim) if x.strip()]
-    d_list = [x.strip() for x in raw_d.split(delim) if x.strip()]
-    j_list = [x.strip() for x in raw_j.split(delim) if x.strip()]
-
-    # 4. Align Lists (Ensure all lists are length of nt_list)
-    aligned_aa = apply_alignment_rules(nt_list, aa_list, "AA")
-    aligned_v = apply_alignment_rules(nt_list, v_list, "V")
-    aligned_d = apply_alignment_rules(nt_list, d_list, "D")
-    aligned_j = apply_alignment_rules(nt_list, j_list, "J")
-
     results = []
     val_positive = row[cols['positive']] if pd.notna(row[cols['positive']]) else 0
 
-    # 5. Iterate by Index (Coupling Guarantee)
-    for i, seq in enumerate(nt_list):
+    for aa in aa_list:
+        # --- FILTER: DROP TRA ---
+        if "TRA:" in aa:
+            continue
+            
+        # Clean the sequence
+        clean_aa = clean_sequence(aa, prefixes)
         
-        # Retrieve parallel attributes
-        aa_val = aligned_aa[i] if i < len(aligned_aa) else None
-        v_val = aligned_v[i] if i < len(aligned_v) else None
-        d_val = aligned_d[i] if i < len(aligned_d) else None
-        j_val = aligned_j[i] if i < len(aligned_j) else None
-
-        # 6. Filter TRB Only
-        # We check the V-gene associated with THIS index.
-        if v_val and "TRB" in v_val:
+        if clean_aa:
             results.append({
-                'junction': seq,       # NT
-                'junction_aa': aa_val, # AA (Correctly paired via index i)
-                'v_call': v_val,
-                'd_call': d_val,
-                'j_call': j_val,
-                'positive': val_positive,
-                'original_index': row.name
+                'junction_aa': clean_aa,
+                'v_call': selected_v,
+                'd_call': selected_d,
+                'j_call': selected_j,
+                'positive': val_positive
             })
             
     return results
@@ -139,7 +102,7 @@ def process_tcr_data(input_file, output_file, config):
         logger.error(f"Failed to read file: {e}")
         sys.exit(1)
 
-    # Filter Rows
+    # Filter Rows (Thresholds)
     n = config['filtering']['threshold']
     high_cols = identify_columns(cm, config['filtering'].get('high_count_criteria'))
     low_cols = identify_columns(cm, config['filtering'].get('low_count_criteria'))
@@ -148,50 +111,50 @@ def process_tcr_data(input_file, output_file, config):
         mask_high = (cm[high_cols] > n).all(axis=1) if high_cols else pd.Series(True, index=cm.index)
         mask_low = (cm[low_cols] <= n).all(axis=1) if low_cols else pd.Series(True, index=cm.index)
         cm_filtered = cm[mask_high & mask_low].copy()
-        logger.info(f"Filtered rows: {len(cm)} -> {len(cm_filtered)}")
+        logger.info(f"Filtered rows based on counts: {len(cm)} -> {len(cm_filtered)}")
     else:
         cm_filtered = cm.copy()
     
-    # Explode
-    logger.info("Exploding rows and syncing AA/NT sequences...")
+    # Explode Logic
+    logger.info("Exploding TRB chains...")
     exploded_data = []
     for idx, row in cm_filtered.iterrows():
-        row.name = idx
         exploded_data.extend(process_row(row, config))
     
     if not exploded_data:
-        logger.error("No valid TRB chains found!")
+        logger.error("No valid TRB chains found after processing!")
         sys.exit(1)
 
     df_exploded = pd.DataFrame(exploded_data)
 
-    # Aggregation
-    logger.info("Aggregating clones by Nucleotide sequence...")
+    # Aggregation: Group by Amino Acid sequence
+    logger.info("Aggregating by unique Junction AA...")
+    
     agg_rules = {
         'positive': 'sum',
-        'junction_aa': 'first',
-        'v_call': 'first',
+        'v_call': 'first', 
         'd_call': 'first',
-        'j_call': 'first',
-        'original_index': 'count'
+        'j_call': 'first'
     }
     
-    df_grouped = df_exploded.groupby('junction').agg(agg_rules).reset_index()
-    df_grouped.rename(columns={'original_index': 'n_chains_aggregated'}, inplace=True)
+    # Grouping by junction_aa
+    df_grouped = df_exploded.groupby('junction_aa').agg(agg_rules).reset_index()
 
-    # Ranking
-    logger.info("Ranking and assigning Clonotype IDs...")
-    df_grouped = df_grouped.sort_values(by='positive', ascending=False).reset_index(drop=True)
-    df_grouped['clonotype_id'] = 'clonotype' + (df_grouped.index + 1).astype(str)
+    # Sort by count descending (Most abundant first)
+    df_final = df_grouped.sort_values(by='positive', ascending=False).copy()
     
-    cols = ['clonotype_id', 'positive', 'junction', 'junction_aa', 'v_call', 'd_call', 'j_call', 'n_chains_aggregated']
-    df_final = df_grouped[cols]
+    # --- NEW: Add ID Column (1 to n) ---
+    df_final.insert(0, 'id', range(1, 1 + len(df_final)))
+
+    # Final Column Selection
+    cols_to_save = ['id', 'junction_aa', 'positive', 'v_call', 'd_call', 'j_call']
+    df_final = df_final[cols_to_save]
 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out_sep = ',' if output_file.endswith('.csv') else '\t'
     df_final.to_csv(output_file, sep=out_sep, index=False)
-    logger.info(f"Saved {len(df_final)} clones to {output_file}")
+    logger.info(f"Saved {len(df_final)} unique TRBs to {output_file}")
 
 def main():
     parser = argparse.ArgumentParser()

@@ -1,0 +1,59 @@
+# highconf_config.yaml
+
+filtering:
+  threshold: 10
+  
+  high_count_criteria:
+    exact: ["positive"]
+    startswith: []
+    endswith: []
+
+  low_count_criteria:
+    exact: []
+    startswith: ["peptide"]
+    endswith: []
+
+processing:
+  sequence_column: "cdr3s_aa"
+  delimiter: ";"
+  target_chain_prefix: "TRB:"
+  strip_prefix: true
+  count_source_column: "positive"
+
+column_map:
+  junction_aa: "junction_aa"
+  clonotype_id: "clonotype_id"
+  count: "count"
+  v_call: "v_call"
+  d_call: "d_call"
+  j_call: "j_call"
+
+deduplication:
+  perform_dedup: true
+
+  group_by_cols: ["junction_aa", "v_call", "j_call"] 
+  
+  aggregation_col: "count"
+  aggregation_method: "max"
+  size_metric_name: "n_instances"
+  
+uniquification:
+  # What to do when one clonotype_id has multiple chains?
+  
+  # Options:
+  # "counter" -> Appends _1, _2 (e.g., AC02_clonotype1_1, AC02_clonotype1_2)
+  # "gene"    -> Appends V-gene (e.g., AC02_clonotype1_TRBV12, AC02_clonotype1_TRBV5)
+  method: "counter"
+  
+  # Separator to use between ID and suffix
+  separator: "_"
+
+  # STEP 2 KEYS: Defining a unique biological receptor
+  group_by_cols:
+    - "junction_aa"
+    - "v_call"
+    - "j_call"
+  
+  aggregation_col: "count"
+  aggregation_method: "max"
+  size_metric_name: "n_instances"

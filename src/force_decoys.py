@@ -101,6 +101,8 @@ class SmartDecoyGenerator:
 
         self.v_map = {v.split('*')[0]: i for i, v in enumerate(v_list)}
         self.j_map = {j.split('*')[0]: i for i, j in enumerate(j_list)}
+        self.v_list = v_list
+        self.j_list = j_list
 
     def _parse_gene_file(self, filepath):
         names = []
@@ -127,7 +129,18 @@ class SmartDecoyGenerator:
             if retry_name in mapping: return mapping[retry_name]
         return None
 
-    def calculate_pgen(self, aa_seq, v_idx=None, j_idx=None):
+    def get_gene_name(self, index, gene_type):
+        try:
+            return self.v_list[index] if gene_type == 'V' else self.j_list[index]
+        except (IndexError, TypeError):
+            return "Unknown"
+
+    def calculate_pgen(self, aa_seq):
+        """
+        Calculates the Marginal Pgen (Probability of generating this AA sequence
+        summed over all possible V/J/Recombination events).
+        This is the standard metric for 'Generation Probability'.
+        """
         try:
             return self.gen_prob.compute_aa_cdr3_pgen(aa_seq)
         except (TypeError, AttributeError):
@@ -138,19 +151,15 @@ class SmartDecoyGenerator:
 
     def find_decoy_with_diagnostics(self, target_v_idx, target_j_idx, target_len, target_pgen, 
                                    max_attempts=1000, tol_log10=0.5, validated_seqs=set(), min_dist=2):
-        """
-        Forces generation loop to try and find a match, logging failure reasons.
-        """
-        # Diagnostic counters
-        fail_gene = 0
+        
+        fail_gene_strict = 0
         fail_len = 0
         fail_pgen = 0
         collision_count = 0
         
         target_log = math.log10(target_pgen) if target_pgen > 0 else -50
-        
-        # Generation Loop
-        # Renamed variable to attempt_idx to be explicit and avoid any weird implicit '_' behavior
+        relaxed_candidate = None
+
         for attempt_idx in range(int(max_attempts)):
             try:
                 item = self.seq_gen.gen_rnd_prod_CDR3()
@@ -160,18 +169,18 @@ class SmartDecoyGenerator:
             if len(item) == 4: _, cdr3, v, j = item
             else: cdr3, v, j = item[0], item[1], item[2]
 
-            # 1. Check Gene Usage
-            if v != target_v_idx or j != target_j_idx:
-                fail_gene += 1
+            # 1. CRITICAL V CHECK (V must always match)
+            if v != target_v_idx:
+                fail_gene_strict += 1
                 continue
             
-            # 2. Check Length (Only reached if genes match)
+            # 2. Check Length
             if len(cdr3) != target_len:
                 fail_len += 1
                 continue
-                
-            # 3. Check Pgen (Only reached if genes AND length match)
-            pgen = self.calculate_pgen(cdr3, v, j)
+
+            # 3. Check Pgen (Calculated using the generated sequence)
+            pgen = self.calculate_pgen(cdr3)
             if pgen <= 0:
                 fail_pgen += 1
                 continue
@@ -181,49 +190,65 @@ class SmartDecoyGenerator:
                 fail_pgen += 1
                 continue
 
-            # 4. Check Collision (Only reached if Pgen also matches)
+            # 4. Check Collision
             collision = False
             for val_seq in validated_seqs:
                 if abs(len(cdr3) - len(val_seq)) >= min_dist: continue
                 if Levenshtein.distance(cdr3, val_seq) < min_dist:
-                    collision = True
-                    break
+                    collision = True; break
             
             if collision:
                 collision_count += 1
                 continue
 
-            # SUCCESS
-            return {
-                'success': True,
-                'decoy': cdr3,
-                'decoy_pgen': pgen,
-                'attempts': attempt_idx + 1,
-                'bottleneck': 'None'
-            }
-
-        # FAILURE DIAGNOSIS
-        total_gene_ok = max_attempts - fail_gene
-        total_len_ok = total_gene_ok - fail_len
-        
-        reason = "Unknown"
-        
-        if fail_gene / max_attempts > 0.99:
-            reason = "V/J Gene Rare"
-        elif total_gene_ok > 0 and (fail_len / total_gene_ok > 0.95):
-            reason = "Length Mismatch"
-        elif total_len_ok > 0 and (fail_pgen / total_len_ok > 0.95):
-            reason = "Pgen Mismatch"
-        elif collision_count > 0:
-            reason = "Collision with Validation Set"
+            # --- SUCCESS ---
             
+            # Case A: Strict Match
+            if j == target_j_idx:
+                return {
+                    'success': True,
+                    'decoy': cdr3,
+                    'decoy_pgen': pgen,
+                    'decoy_v_idx': v,
+                    'decoy_j_idx': j,
+                    'attempts': attempt_idx + 1,
+                    'match_type': 'Strict (V+J)',
+                    'bottleneck': 'None'
+                }
+            
+            # Case B: Relaxed Match (Backup)
+            if relaxed_candidate is None:
+                relaxed_candidate = {
+                    'success': True,
+                    'decoy': cdr3,
+                    'decoy_pgen': pgen,
+                    'decoy_v_idx': v,
+                    'decoy_j_idx': j,
+                    'attempts': attempt_idx + 1,
+                    'match_type': 'Relaxed (V only)',
+                    'bottleneck': 'Relaxed J fallback'
+                }
+
+        # End of loop
+        if relaxed_candidate is not None:
+            return relaxed_candidate
+
+        # Failure
+        total_len_ok = max_attempts - fail_gene_strict - fail_len
+        reason = "Unknown"
+        if fail_gene_strict / max_attempts > 0.95: reason = "V Gene Rare"
+        elif (fail_len / (max_attempts - fail_gene_strict + 1)) > 0.95: reason = "Length Mismatch"
+        elif total_len_ok > 0 and (fail_pgen / total_len_ok > 0.95): reason = "Pgen Mismatch"
+        elif collision_count > 0: reason = "Collision"
+
         return {
             'success': False,
-            'decoy': None,
-            'decoy_pgen': None,
+            'decoy': None, 'decoy_pgen': None,
+            'decoy_v_idx': None, 'decoy_j_idx': None,
+            'match_type': 'None',
             'attempts': max_attempts,
             'bottleneck': reason,
-            'stats': f"G:{fail_gene}|L:{fail_len}|P:{fail_pgen}"
+            'stats': f"GV:{fail_gene_strict}|L:{fail_len}|P:{fail_pgen}"
         }
 
 def load_config(config_path):
@@ -244,19 +269,10 @@ def main():
     output_file = config.get('output_file', 'diagnostic_decoys.csv')
     params = config.get('parameters', {})
     
-    # --- SAFETY FIX: Force integers here ---
     max_samples = int(params.get('diagnostic_samples', 20000))
     max_input_seqs_raw = params.get('max_input_sequences', None)
-
-    L_dist_raw = params.get('levenshtein_distance_threshold', 1)
-    try:
-        L_dist = int(L_dist_raw)
-    except ValueError:
-        print(f"Warning: 'levenshtein_distance_threshold' was {L_dist_raw}. Defaulting to 1.")
-        L_dist = 1
-        
+    L_dist = int(params.get('levenshtein_distance_threshold', 1))
     pgen_tol = float(params.get('pgen_tolerance_log10', 0.5))
-    # ---------------------------------------
 
     print(f"Reading {input_file}...")
     try:
@@ -266,7 +282,6 @@ def main():
         print(f"Error: Input file '{input_file}' not found.")
         sys.exit(1)
 
-    # --- NEW LIMITING LOGIC ---
     if max_input_seqs_raw is not None:
         try:
             limit = int(max_input_seqs_raw)
@@ -274,8 +289,7 @@ def main():
                 print(f"Limiting input to the first {limit} sequences.")
                 df = df.head(limit)
         except ValueError:
-            print(f"Warning: 'max_input_sequences' must be an integer. Processing all sequences.")
-    # --------------------------
+            pass
     
     try:
         generator = SmartDecoyGenerator(species=config.get('species', 'human'))
@@ -285,13 +299,11 @@ def main():
     
     print(f"\n--- Starting Diagnostic Generation ---")
     print(f"Attempts per sequence: {max_samples}")
-    print(f"Tolerance (Log10 Pgen): {pgen_tol}")
     print("Looping through input list...")
     
     validated_seqs = set(df['junction_aa'].dropna().unique())
     results = []
 
-    # Pre-calculate indices to save time
     df['v_idx'] = df['v_call'].apply(lambda x: generator.get_gene_index(x, 'V'))
     df['j_idx'] = df['j_call'].apply(lambda x: generator.get_gene_index(x, 'J'))
 
@@ -302,59 +314,62 @@ def main():
         j_idx = row['j_idx']
         seq = row['junction_aa']
         
-        # Validation checks
         if pd.isna(v_idx) or pd.isna(j_idx) or not isinstance(seq, str):
             results.append({
-                'target_id': idx, 'target_aa': seq, 'status': 'Invalid Input', 'bottleneck': 'Bad Gene Name'
+                'target_id': idx, 'target_aa': seq, 'status': 'Invalid Input'
             })
             continue
 
-        # Calculate target Pgen
-        target_pgen = generator.calculate_pgen(seq, v_idx, j_idx)
+        # --- KEY CHANGE: Calculate Pgen for Input Sequence ---
+        target_pgen = generator.calculate_pgen(seq)
         
-        # Run Diagnostic Generation
+        # --- KEY CHANGE: Calculate Theoretical Attempts ---
+        if target_pgen > 0:
+            theoretical_attempts = 1.0 / target_pgen
+        else:
+            theoretical_attempts = float('inf')
+
         diag = generator.find_decoy_with_diagnostics(
-            target_v_idx=v_idx,
-            target_j_idx=j_idx,
-            target_len=len(seq),
-            target_pgen=target_pgen,
-            max_attempts=max_samples,
-            tol_log10=pgen_tol,
-            validated_seqs=validated_seqs,
-            min_dist=L_dist + 1
+            target_v_idx=v_idx, target_j_idx=j_idx, target_len=len(seq), target_pgen=target_pgen,
+            max_attempts=max_samples, tol_log10=pgen_tol, validated_seqs=validated_seqs, min_dist=L_dist + 1
         )
         
-        # Compile Result
+        # --- PREPARE OUTPUT ROW ---
         res_row = {
             'target_id': idx,
             'target_aa': seq,
+            
+            # The Mathematical Evidence
             'target_pgen': target_pgen,
-            'v_call': row['v_call'],
-            'j_call': row['j_call'],
+            'theoretical_attempts_needed': theoretical_attempts,
+            
+            'target_v_call': row['v_call'],
+            'target_j_call': row['j_call'],
+            
             'status': 'Found' if diag['success'] else 'Failed',
+            'match_type': diag['match_type'],
             'bottleneck': diag['bottleneck'],
+            
             'decoy_aa': diag['decoy'],
-            'decoy_pgen': diag['decoy_pgen'],
+            'decoy_pgen': diag['decoy_pgen'], 
             'attempts_used': diag['attempts'],
-            'fail_stats': diag.get('stats', '')
         }
         
-        if diag['success']:
-            res_row['pgen_diff_log10'] = abs(math.log10(diag['decoy_pgen']) - math.log10(target_pgen))
+        if diag['success'] and diag['decoy_v_idx'] is not None:
+            res_row['decoy_v_call'] = generator.get_gene_name(diag['decoy_v_idx'], 'V')
+            res_row['decoy_j_call'] = generator.get_gene_name(diag['decoy_j_idx'], 'J')
         else:
-            res_row['pgen_diff_log10'] = None
-            
+            res_row['decoy_v_call'] = None
+            res_row['decoy_j_call'] = None
+
         results.append(res_row)
 
-        # Progress bar
         if idx % 10 == 0:
-            elapsed = time.time() - start_time
-            print(f"Processed {idx+1}/{len(df)} | Last Result: {res_row['status']} ({res_row['bottleneck']})", end='\r')
+            stat_msg = diag['match_type'] if diag['success'] else diag['bottleneck']
+            print(f"Processed {idx+1}/{len(df)} | Last: {stat_msg}", end='\r')
 
-    # Save Output
     pd.DataFrame(results).to_csv(output_file, index=False)
-    print(f"\n\nDone. Saved diagnostics to {output_file}.")
-    print(f"Total time: {time.time()-start_time:.2f}s")
+    print(f"\n\nDone. Saved to {output_file}.")
 
 if __name__ == "__main__":
     main()

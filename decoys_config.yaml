@@ -22,4 +22,11 @@ parameters:
   # Performance Tuning
   # How many random candidates to attempt to generate for each V-J-Length bucket
   # Increase this if you find '0 decoys found' for many rows.
-  pool_prime_min_candidates: 100
+  pool_prime_min_candidates: 1
+
+debug:
+  debug_dir: /Users/ishaharris/Projects/TCR/clono-scan/data/decoys/debug/
+  sample_gen_count: 500            # how many generated items to sample for raw inspection
+  gen_full_log_limit: 5000        # how many generated lines to record in gen_full_log (avoid huge files)
+  pool_report_top_missing: 200
+

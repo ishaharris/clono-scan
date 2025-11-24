@@ -11,20 +11,13 @@ species: "human"
 
 # --- Algorithm Parameters ---
 parameters:
-  # How many valid decoys to generate per input sequence
   decoys_per_sequence: 1
-
-  # How strictly the Pgen must match the input sequence.
-  # Since we are scrambling, exact matches are rare. 
-  # 0.5 means the decoy Pgen is within +/- 0.5 (log10 scale) of the target.
-  # Suggested: 0.5 to 1.0 for scrambling.
-  pgen_tolerance_log10: 1
-
-  # How different the decoy must be from the input (Levenshtein distance).
-  # 2 means at least 2 amino acid changes.
-  levenshtein_distance_threshold: 2
-
-  # How many times to try scrambling a sequence before giving up.
-  # Scrambling is random, so higher numbers increase success rate but slow down the script.
-  max_scramble_iterations: 5000
-  anchor_length: 3
+  pgen_tolerance_log10: 1  # You can probably keep this tight now (0.5 or 0.3)
+  levenshtein_distance_threshold: 4
+  max_scramble_iterations: 3000
+  anchor_length: 2
+  
+  # NEW PARAMETER
+  # Defines the max number of amino acids to swap in one attempt. 
+  # The script will randomly choose between 1 and this number.
+  max_mutations_per_attempt: 8

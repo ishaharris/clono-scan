@@ -1,0 +1,30 @@
+# --- File Paths ---
+# Path to your input TSV/CSV containing 'junction_aa', 'v_call', and 'j_call'
+input_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/highconf/AC02.tsv"
+
+# Where to save the results
+output_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/decoys/scrambled/AC02_scrambled.csv"
+
+# --- Biological Settings ---
+# Options: 'human' or 'mouse' (default is human)
+species: "human" 
+
+# --- Algorithm Parameters ---
+parameters:
+  # How many valid decoys to generate per input sequence
+  decoys_per_sequence: 1
+
+  # How strictly the Pgen must match the input sequence.
+  # Since we are scrambling, exact matches are rare. 
+  # 0.5 means the decoy Pgen is within +/- 0.5 (log10 scale) of the target.
+  # Suggested: 0.5 to 1.0 for scrambling.
+  pgen_tolerance_log10: 1
+
+  # How different the decoy must be from the input (Levenshtein distance).
+  # 2 means at least 2 amino acid changes.
+  levenshtein_distance_threshold: 2
+
+  # How many times to try scrambling a sequence before giving up.
+  # Scrambling is random, so higher numbers increase success rate but slow down the script.
+  max_scramble_iterations: 5000
+  anchor_length: 3

@@ -1,0 +1,9 @@
+input_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/highconf/AC02.tsv"
+output_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/decoys/debug/force.csv"
+species: "human"
+parameters:
+  diagnostic_samples: 1000000        # How many times to try per row. Lower = Faster but less rigorous.
+  pgen_tolerance_log10: 2
+  levenshtein_distance_threshold: 1
+
+  max_input_sequences: 2

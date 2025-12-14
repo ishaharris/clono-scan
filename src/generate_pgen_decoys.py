@@ -9,6 +9,7 @@ import math
 import bisect
 import yaml
 import contextlib
+import pickle
 from collections import defaultdict
 
 # --- OLGA IMPORTS ---
@@ -161,38 +162,52 @@ class SmartDecoyGenerator:
             except Exception:
                 return 0.0
 
-    def prime_pool(self, unique_lengths, min_candidates=1000):
-        print(f"Priming pool for {len(unique_lengths)} unique lengths...")
-        
-        needed_lengths = set(unique_lengths)
-        
-        # --- STRATIFICATION SETTINGS (ADJUSTED) ---
-        # High Pgen matches are rare. We lower the requirement to 5 to avoid
-        # getting stuck in infinite loops for lengths that are naturally rare.
-        high_threshold = 1e-07
-        min_high_candidates = 5       # <--- CHANGED: Reduced from 50 to 5
-        safety_cap_per_length = 2000  # <--- CHANGED: Reduced from 50,000 to 2,000
-        
-        # Track counts: Total vs High-Pgen
-        counts_total = {l: 0 for l in needed_lengths}
-        counts_high = {l: 0 for l in needed_lengths}
+    # --- POOL PERSISTENCE ---
+    def save_pool(self, filepath):
+        print(f"Saving pool to {filepath}...")
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.pool, f)
+        print(f"Pool saved. Contains {sum(len(v) for v in self.pool.values())} sequences across {len(self.pool)} lengths.")
 
+    def load_pool(self, filepath):
+        if not os.path.exists(filepath):
+            print(f"Pool file {filepath} not found. Starting with empty pool.")
+            return False
+        
+        print(f"Loading pool from {filepath}...")
+        try:
+            with open(filepath, 'rb') as f:
+                loaded_data = pickle.load(f)
+                for k, v in loaded_data.items():
+                    self.pool[k] = v
+            print(f"Pool loaded. Total sequences: {sum(len(v) for v in self.pool.values())}")
+            return True
+        except Exception as e:
+            print(f"Error loading pool: {e}")
+            return False
+
+    def prime_pool(self, unique_lengths, min_candidates=1000):
+        needed_lengths = set()
+        for l in unique_lengths:
+            if len(self.pool[l]) < min_candidates:
+                needed_lengths.add(l)
+        
+        if not needed_lengths:
+            print("Pool is already sufficient for all requested lengths.")
+            return
+
+        print(f"Priming pool for {len(needed_lengths)} specific lengths...")
+        
+        counts_total = {l: len(self.pool[l]) for l in needed_lengths}
         target_total = min_candidates
         max_total_gen = 50_000_000 
-        batch_size = 100  # Reduced batch size slightly for more responsive updates
+        batch_size = 500 
         
         total_generated = 0
-        total_stored = 0
+        total_added = 0
         start_t = time.time()
         
-        print(f"Goal per length: {target_total} total OR ({min_high_candidates} > {high_threshold})")
-
-        while total_generated < max_total_gen:
-            if not needed_lengths:
-                print(f"\n[!] Success: All buckets satisfied.")
-                break
-
-            # --- SILENT BATCH GENERATION ---
+        while total_generated < max_total_gen and needed_lengths:
             with suppress_output():
                 batch_generated = 0
                 while batch_generated < batch_size:
@@ -209,81 +224,85 @@ class SmartDecoyGenerator:
 
                     l = len(cdr3)
 
-                    # Only process if this length is still needed
                     if l in needed_lengths:
                         pgen = self.calculate_pgen(cdr3, v, j)
-                        
                         if pgen > 0:
                             self.pool[l].append((pgen, cdr3))
                             counts_total[l] += 1
-                            total_stored += 1
+                            total_added += 1
                             
-                            # Track High Pgen separately
-                            if pgen >= high_threshold:
-                                counts_high[l] += 1
-                            
-                            # --- STOPPING LOGIC ---
-                            # 1. Quality Met: We have enough TOTAL candidates AND enough HIGH Pgen candidates
-                            quality_met = (counts_total[l] >= target_total and counts_high[l] >= min_high_candidates)
-                            
-                            # 2. Safety Valve: We have generated enough candidates to know 
-                            #    that high-pgen versions of this length likely don't exist.
-                            safety_met = (counts_total[l] >= safety_cap_per_length)
-                            
-                            if quality_met or safety_met:
+                            if counts_total[l] >= target_total:
                                 needed_lengths.remove(l)
+                                if not needed_lengths: break
 
-            # --- PROGRESS UPDATE ---
             elapsed = time.time() - start_t
             rate = total_generated / elapsed if elapsed > 0 else 0
             
-            # Show "High Pgen" progress in the status bar
-            total_high_found = sum(counts_high.values())
-            
             sys.stdout.write(
                 f"\r>> Gen: {total_generated:,} | "
-                f"Pool: {total_stored:,} (High Pgen: {total_high_found}) | "
-                f"Active Lens: {len(needed_lengths)} | "
+                f"Added: {total_added:,} | "
+                f"Remaining Lengths: {len(needed_lengths)} | "
                 f"Rate: {int(rate)}/s"
             )
             sys.stdout.flush()
 
+        # --- RESCUE PHASE ---
+        if needed_lengths:
+            print(f"\n[!] Warning: {len(needed_lengths)} lengths still under-filled. Attempting targeted rescue...")
+            for l in list(needed_lengths):
+                if len(self.pool[l]) > 0: continue 
+
+                print(f"   -> Forcing generation for length {l}...")
+                att = 0
+                while len(self.pool[l]) < 50 and att < 200000:
+                    att += 1
+                    with suppress_output():
+                        item = self.seq_gen.gen_rnd_prod_CDR3()
+                        cdr3 = item[1] if len(item) == 4 else item[0]
+                        if len(cdr3) == l:
+                             v = item[2] if len(item) == 4 else item[1]
+                             j = item[3] if len(item) == 4 else item[2]
+                             pgen = self.calculate_pgen(cdr3, v, j)
+                             self.pool[l].append((pgen, cdr3))
+
         sys.stdout.write("\n")
-        print(f"Finished. Total stored: {total_stored:,}")
+        print(f"Finished. Total sequences in memory: {sum(len(v) for v in self.pool.values()):,}")
         
-        # Sort pool by Pgen (Low to High) for Binary Search later
         for l in self.pool:
-            self.pool[l].sort(key=lambda x: x[0])
+            self.pool[l].sort(key=lambda x: x[0])       
 
     def find_pgen_matched_decoys(self, target_pgen, length, 
-                                 n_decoys=5, tol_log10=0.5, 
+                                 n_decoys=5, 
                                  all_validated_seqs=set(), min_dist=2):
+        """
+        Returns: (list_of_decoys, failure_reason_string)
+        """
         candidates = self.pool[length]
-        if not candidates: return []
+        
+        # Reason 1: No pool
+        if not candidates: 
+            return [], f"Pool empty for length {length}"
 
-        pgens = [x[0] for x in candidates]
-        idx = bisect.bisect_left(pgens, target_pgen)
-        found_decoys = []
-        
-        search_radius = n_decoys * 50 
-        start = max(0, idx - search_radius)
-        end = min(len(candidates), idx + search_radius)
-        subset = candidates[start:end]
-        
         target_log = math.log10(target_pgen) if target_pgen > 0 else -50
-        subset.sort(key=lambda x: abs(math.log10(x[0]) - target_log) if x[0] > 0 else 999)
 
-        for pgen, seq in subset:
+        def get_log_diff(pgen_val):
+            if pgen_val <= 0: return 999.0
+            val_log = math.log10(pgen_val)
+            return abs(val_log - target_log)
+
+        # Sort by Pgen closeness
+        sorted_candidates = sorted(candidates, key=lambda x: get_log_diff(x[0]))
+        
+        found_decoys = []
+        filtered_count = 0
+        
+        # FIRST PASS: Strict Levenshtein
+        for pgen, seq in sorted_candidates:
             if len(found_decoys) >= n_decoys: break
             if pgen <= 0: continue
             
-            log_diff = abs(math.log10(pgen) - target_log)
-            if log_diff > tol_log10: continue 
-
             collision = False
-            
-            if seq in all_validated_seqs:
-                collision = True
+            if seq in all_validated_seqs: collision = True
             
             if not collision and min_dist > 0:
                 for val_seq in all_validated_seqs:
@@ -294,8 +313,37 @@ class SmartDecoyGenerator:
             
             if not collision:
                 found_decoys.append((seq, pgen))
+            else:
+                filtered_count += 1
+
+        # SECOND PASS (Fallback): Relax Levenshtein if needed
+        used_fallback = False
+        if len(found_decoys) < n_decoys:
+            needed = n_decoys - len(found_decoys)
+            existing_seqs = set(x[0] for x in found_decoys)
+            
+            for pgen, seq in sorted_candidates:
+                if len(found_decoys) >= n_decoys: break
+                if seq in existing_seqs: continue
+                if seq in all_validated_seqs: continue # Still reject exact real seqs
                 
-        return found_decoys
+                found_decoys.append((seq, pgen))
+                existing_seqs.add(seq)
+                used_fallback = True
+
+        # --- DIAGNOSE REASON ---
+        if len(found_decoys) == n_decoys:
+            if used_fallback:
+                 return found_decoys, "Filled using relaxed Levenshtein fallback"
+            else:
+                 return found_decoys, "Full"
+        else:
+            # We still don't have enough
+            total_avail = len(candidates)
+            if total_avail < n_decoys:
+                return found_decoys, f"Pool exhausted (only {total_avail} candidates existed)"
+            else:
+                return found_decoys, f"Filtered by validation set collision (rejected {filtered_count} candidates)"
 
 def load_config(config_path):
     try:
@@ -308,12 +356,14 @@ def load_config(config_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='decoys_config.yaml')
+    parser.add_argument('--pool_file', default=None, help='Path to .pkl file to save/load pool')
     args = parser.parse_args()
     config = load_config(args.config)
     
     input_file = config.get('input_file')
     output_file = config.get('output_file', 'decoys_output.csv')
     params = config.get('parameters', {})
+    target_count = params.get('decoys_per_sequence', 5)
     
     print(f"Reading {input_file}...")
     try:
@@ -327,9 +377,10 @@ def main():
         generator = SmartDecoyGenerator(species=config.get('species', 'human'))
     except Exception as e:
         print(f"Generator Initialization Failed: {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
+    
+    if args.pool_file:
+        generator.load_pool(args.pool_file)
     
     print("Analyzing input requirements...")
     required_lengths = set()
@@ -348,13 +399,16 @@ def main():
         else:
             row_metadata.append(None)
 
-    generator.prime_pool(required_lengths, min_candidates=params.get('pool_prime_min_candidates', 50))
+    generator.prime_pool(required_lengths, min_candidates=params.get('pool_prime_min_candidates', 1000))
+    
+    if args.pool_file:
+        generator.save_pool(args.pool_file)
     
     validated_seqs = set(df['junction_aa'].dropna().unique())
     results = []
     L = params.get('levenshtein_distance_threshold', 1)
 
-    print("Finding matched decoys (Matching on Length + Pgen only)...")
+    print("Finding 'best possible' matched decoys...")
     start_time = time.time()
     
     matches_count = 0
@@ -364,20 +418,21 @@ def main():
         meta = row_metadata[real_idx]
         target_aa = meta['seq']
         
-        # --- PROGRESS INDICATOR (Updates continuously) ---
-        sys.stdout.write(f"\rProcessing {i+1}/{total_targets} | Total Matches: {matches_count}...")
+        sys.stdout.write(f"\rProcessing {i+1}/{total_targets}...")
         sys.stdout.flush()
         
         target_pgen = generator.calculate_pgen(target_aa, meta['v'], meta['j'])
         
-        decoys = generator.find_pgen_matched_decoys(
+        decoys, reason = generator.find_pgen_matched_decoys(
             target_pgen, len(target_aa),
-            n_decoys=params.get('decoys_per_sequence', 5),
-            tol_log10=params.get('pgen_tolerance_log10', 1.0),
+            n_decoys=target_count,
             all_validated_seqs=validated_seqs,
             min_dist=L + 1
         )
         
+        matches_count += len(decoys)
+        
+        # If no decoys found, log the failure reason
         if not decoys:
              results.append({
                  'target_id': real_idx,
@@ -388,16 +443,10 @@ def main():
                  'decoy_rank': None,
                  'decoy_aa': None,
                  'decoy_pgen': None,
-                 'pgen_diff_log10': None
+                 'pgen_diff_log10': None,
+                 'missing_reason': reason
              })
              continue
-        
-        # --- MATCH FOUND PRINT ---
-        matches_count += 1
-        # \r clears the line so the log print starts fresh
-        # \n at the end ensures the log line stays, and the progress bar redraws below it on next loop
-        sys.stdout.write(f"\r[+] Target {i+1} ({target_aa}): Found {len(decoys)} decoys (Pgen: {target_pgen:.2e})\n")
-        sys.stdout.flush()
 
         for k, (d_seq, d_pgen) in enumerate(decoys):
             results.append({
@@ -409,7 +458,8 @@ def main():
                 'decoy_rank': k+1,
                 'decoy_aa': d_seq,
                 'decoy_pgen': d_pgen,
-                'pgen_diff_log10': abs(math.log10(d_pgen) - math.log10(target_pgen)) if target_pgen > 0 and d_pgen > 0 else None
+                'pgen_diff_log10': abs(math.log10(d_pgen) - math.log10(target_pgen)) if target_pgen > 0 and d_pgen > 0 else None,
+                'missing_reason': reason if len(decoys) < target_count else "Full"
             })
 
     pd.DataFrame(results).to_csv(output_file, index=False)

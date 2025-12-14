@@ -1,6 +1,6 @@
 # Input and Output paths
 input_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/highconf/AC02.tsv"
-output_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/decoys/AC02_decoy.csv"
+output_file: "/Users/ishaharris/Projects/TCR/clono-scan/data/decoys/AC02_pgen_decoy.csv"
 
 # Model Settings
 species: "human"  # 'human' or 'mouse'
@@ -12,12 +12,12 @@ parameters:
   levenshtein_distance_threshold: 3
 
   # Number of decoys to generate per input sequence
-  decoys_per_sequence: 1
+  decoys_per_sequence: 5
 
   # Pgen Matching Tolerance (Log10 units)
   # 1.0 means the decoy Pgen must be within 1 order of magnitude of the target
   # 0.5 is stricter, 2.0 is looser
-  pgen_tolerance_log10: 2.0
+  pgen_tolerance_log10: 0.2
 
   # Performance Tuning
   # How many random candidates to attempt to generate for each V-J-Length bucket

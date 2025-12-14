@@ -165,28 +165,34 @@ class SmartDecoyGenerator:
         print(f"Priming pool for {len(unique_lengths)} unique lengths...")
         
         needed_lengths = set(unique_lengths)
-        current_counts = {l: 0 for l in needed_lengths}
         
-        target_count = min_candidates
-        max_total_gen = 50_000_000
+        # --- STRATIFICATION SETTINGS (ADJUSTED) ---
+        # High Pgen matches are rare. We lower the requirement to 5 to avoid
+        # getting stuck in infinite loops for lengths that are naturally rare.
+        high_threshold = 1e-07
+        min_high_candidates = 5       # <--- CHANGED: Reduced from 50 to 5
+        safety_cap_per_length = 2000  # <--- CHANGED: Reduced from 50,000 to 2,000
         
-        # Batch size: We will generate and process this many sequences 
-        # inside the 'silence' block before coming up for air to print.
-        batch_size = 500  
+        # Track counts: Total vs High-Pgen
+        counts_total = {l: 0 for l in needed_lengths}
+        counts_high = {l: 0 for l in needed_lengths}
+
+        target_total = min_candidates
+        max_total_gen = 50_000_000 
+        batch_size = 100  # Reduced batch size slightly for more responsive updates
         
         total_generated = 0
         total_stored = 0
         start_t = time.time()
         
-        print(f"Target: {target_count} seqs per length | Batch size: {batch_size}")
+        print(f"Goal per length: {target_total} total OR ({min_high_candidates} > {high_threshold})")
 
         while total_generated < max_total_gen:
             if not needed_lengths:
-                print(f"\n[!] Success: All {len(unique_lengths)} length buckets filled.")
+                print(f"\n[!] Success: All buckets satisfied.")
                 break
 
-            # --- START SILENT BLOCK ---
-            # Everything in here (generation AND pgen calc) is hidden from stdout
+            # --- SILENT BATCH GENERATION ---
             with suppress_output():
                 batch_generated = 0
                 while batch_generated < batch_size:
@@ -198,49 +204,56 @@ class SmartDecoyGenerator:
                     batch_generated += 1
                     total_generated += 1
 
-                    # Unpack OLGA output
-                    if len(item) == 4:
-                        _, cdr3, v, j = item
-                    else:
-                        cdr3, v, j = item[0], item[1], item[2]
+                    if len(item) == 4: _, cdr3, v, j = item
+                    else: cdr3, v, j = item[0], item[1], item[2]
 
                     l = len(cdr3)
 
-                    # Only calculate Pgen if we still need this length
+                    # Only process if this length is still needed
                     if l in needed_lengths:
-                        # This line triggers the warning, so it MUST be inside suppress_output
                         pgen = self.calculate_pgen(cdr3, v, j)
                         
                         if pgen > 0:
                             self.pool[l].append((pgen, cdr3))
-                            current_counts[l] += 1
+                            counts_total[l] += 1
                             total_stored += 1
                             
-                            if current_counts[l] >= target_count:
+                            # Track High Pgen separately
+                            if pgen >= high_threshold:
+                                counts_high[l] += 1
+                            
+                            # --- STOPPING LOGIC ---
+                            # 1. Quality Met: We have enough TOTAL candidates AND enough HIGH Pgen candidates
+                            quality_met = (counts_total[l] >= target_total and counts_high[l] >= min_high_candidates)
+                            
+                            # 2. Safety Valve: We have generated enough candidates to know 
+                            #    that high-pgen versions of this length likely don't exist.
+                            safety_met = (counts_total[l] >= safety_cap_per_length)
+                            
+                            if quality_met or safety_met:
                                 needed_lengths.remove(l)
-            # --- END SILENT BLOCK ---
 
-            # --- PRINT PROGRESS (Visible!) ---
+            # --- PROGRESS UPDATE ---
             elapsed = time.time() - start_t
             rate = total_generated / elapsed if elapsed > 0 else 0
             
-            buckets_left = len(needed_lengths)
-            total_buckets = len(unique_lengths)
-            percent_done = ((total_buckets - buckets_left) / total_buckets) * 100
+            # Show "High Pgen" progress in the status bar
+            total_high_found = sum(counts_high.values())
             
             sys.stdout.write(
-                f"\r>> Generated: {total_generated:,} | "
-                f"Stored: {total_stored:,} | "
-                f"Lengths Filled: {total_buckets - buckets_left}/{total_buckets} ({percent_done:.1f}%) | "
+                f"\r>> Gen: {total_generated:,} | "
+                f"Pool: {total_stored:,} (High Pgen: {total_high_found}) | "
+                f"Active Lens: {len(needed_lengths)} | "
                 f"Rate: {int(rate)}/s"
             )
             sys.stdout.flush()
 
         sys.stdout.write("\n")
-        print(f"Finished. Total candidates stored: {total_stored:,}")
+        print(f"Finished. Total stored: {total_stored:,}")
         
+        # Sort pool by Pgen (Low to High) for Binary Search later
         for l in self.pool:
-            self.pool[l].sort(key=lambda x: x[0])       
+            self.pool[l].sort(key=lambda x: x[0])
 
     def find_pgen_matched_decoys(self, target_pgen, length, 
                                  n_decoys=5, tol_log10=0.5, 

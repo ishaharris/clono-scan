@@ -118,6 +118,7 @@ class SmartDecoyGenerator:
         if not v_list or not j_list:
             raise AttributeError("Could not determine gene names from attributes or files.")
 
+        # Ensure consistent naming by stripping alleles immediately
         self.v_list_names = [v.split('*')[0] for v in v_list]
         self.j_list_names = [j.split('*')[0] for j in j_list]
         self.v_map = {name: i for i, name in enumerate(self.v_list_names)}
@@ -129,12 +130,19 @@ class SmartDecoyGenerator:
             with open(filepath, 'r') as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith('#') or line.startswith('gene_name'):
+                    # FIX 2: Enhanced filtering to catch headers like "gene" or "gene_name"
+                    if not line or line.startswith('#'):
                         continue
+                    
                     cleaned = line.replace(';', ',').replace('\t', ',')
                     parts = cleaned.split(',')
+                    
                     if parts:
-                        names.append(parts[0].strip())
+                        candidate = parts[0].strip()
+                        # Strict check to avoid reading headers as values
+                        if candidate.lower() in ['gene', 'gene_name', 'allele', 'segment']:
+                            continue
+                        names.append(candidate)
         except Exception:
             pass
         return names
@@ -200,7 +208,7 @@ class SmartDecoyGenerator:
             print(f"Error loading pool: {e}")
             return False
 
-    def prime_pool(self, unique_lengths, min_candidates=1000):
+    def prime_pool(self, unique_lengths, min_candidates=50000): # FIX 3: Increased default from 1000
         needed_lengths = set()
         for l in unique_lengths:
             if len(self.pool[l]) < min_candidates:
@@ -210,10 +218,12 @@ class SmartDecoyGenerator:
             print("Pool is already sufficient for all requested lengths.")
             return
 
-        print(f"Priming pool for {len(needed_lengths)} specific lengths...")
+        print(f"Priming pool for {len(needed_lengths)} specific lengths. Target: {min_candidates} seqs/length.")
         counts_total = {l: len(self.pool[l]) for l in needed_lengths}
         target_total = min_candidates
-        max_total_gen = 50_000_000 
+        
+        # FIX 3: Increased generation limit to allow for deep sampling
+        max_total_gen = 200_000_000 
         batch_size = 500 
         
         total_generated = 0
@@ -295,6 +305,7 @@ class SmartDecoyGenerator:
             val_log = math.log10(pgen_val)
             return abs(val_log - target_log)
 
+        # Sort candidates by how close they are to target Pgen
         sorted_candidates = sorted(candidates, key=lambda x: get_log_diff(x[0]))
         
         found_decoys = []
@@ -337,6 +348,8 @@ class SmartDecoyGenerator:
         return found_decoys, status
 
 def load_config(config_path):
+    if not os.path.exists(config_path):
+        return {}
     try:
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
@@ -351,9 +364,12 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     
-    input_file = config.get('input_file')
+    input_file = config.get('input_file', 'input.csv')
     output_file = config.get('output_file', 'decoys_output_long.csv')
     params = config.get('parameters', {})
+    
+    # FIX 3: Set high default for sampling if not in config
+    pool_prime_min = params.get('pool_prime_min_candidates', 50000) 
     target_count = params.get('decoys_per_sequence', 5)
     
     print(f"Reading {input_file}...")
@@ -379,8 +395,10 @@ def main():
     valid_indices = []
     
     for idx, row in df.iterrows():
-        v_idx = generator.get_gene_index(row['v_call'], 'V')
-        j_idx = generator.get_gene_index(row['j_call'], 'J')
+        v_call = row.get('v_call', pd.NA)
+        j_call = row.get('j_call', pd.NA)
+        v_idx = generator.get_gene_index(v_call, 'V')
+        j_idx = generator.get_gene_index(j_call, 'J')
         seq = row['junction_aa']
         
         if isinstance(seq, str):
@@ -390,7 +408,8 @@ def main():
         else:
             row_metadata.append(None)
 
-    generator.prime_pool(required_lengths, min_candidates=params.get('pool_prime_min_candidates', 1000))
+    # Pass the increased sampling requirement
+    generator.prime_pool(required_lengths, min_candidates=pool_prime_min)
     
     if args.pool_file:
         generator.save_pool(args.pool_file)
@@ -419,14 +438,18 @@ def main():
             min_dist=L + 1
         )
         
+        # FIX 1: Clean input genes so they match output format
+        test_v = str(df.loc[real_idx, 'v_call']).split('*')[0]
+        test_j = str(df.loc[real_idx, 'j_call']).split('*')[0]
+
         # 1. Add the "Test" (Real) Sequence Row
         long_results.append({
-            'pair_id': real_idx,         # Links test to its decoys
-            'sequence_type': 'test',     # Explicit label
-            'rank': 0,                   # 0 = Real
+            'pair_id': real_idx,         
+            'sequence_type': 'test',     
+            'rank': 0,                   
             'junction_aa': target_aa,
-            'v_call': df.loc[real_idx, 'v_call'],
-            'j_call': df.loc[real_idx, 'j_call'],
+            'v_call': test_v, # Now stripped
+            'j_call': test_j, # Now stripped
             'pgen': target_pgen,
             'log_pgen_diff': 0.0,
             'status': 'Original'

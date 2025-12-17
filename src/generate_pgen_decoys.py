@@ -118,8 +118,10 @@ class SmartDecoyGenerator:
         if not v_list or not j_list:
             raise AttributeError("Could not determine gene names from attributes or files.")
 
-        self.v_map = {v.split('*')[0]: i for i, v in enumerate(v_list)}
-        self.j_map = {j.split('*')[0]: i for i, j in enumerate(j_list)}
+        self.v_list_names = [v.split('*')[0] for v in v_list]
+        self.j_list_names = [j.split('*')[0] for j in j_list]
+        self.v_map = {name: i for i, name in enumerate(self.v_list_names)}
+        self.j_map = {name: i for i, name in enumerate(self.j_list_names)}
 
     def _parse_gene_file(self, filepath):
         names = []
@@ -150,6 +152,13 @@ class SmartDecoyGenerator:
             if retry_name in mapping: return mapping[retry_name]
         return None
 
+    def get_gene_name(self, index, gene_type):
+        if index is None or index < 0: return None
+        target_list = self.v_list_names if gene_type == 'V' else self.j_list_names
+        if index < len(target_list):
+            return target_list[index]
+        return "Unknown"
+
     def calculate_pgen(self, aa_seq, v_idx=None, j_idx=None):
         try:
             if v_idx is not None and j_idx is not None:
@@ -167,7 +176,7 @@ class SmartDecoyGenerator:
         print(f"Saving pool to {filepath}...")
         with open(filepath, 'wb') as f:
             pickle.dump(self.pool, f)
-        print(f"Pool saved. Contains {sum(len(v) for v in self.pool.values())} sequences across {len(self.pool)} lengths.")
+        print(f"Pool saved. Contains {sum(len(v) for v in self.pool.values())} sequences.")
 
     def load_pool(self, filepath):
         if not os.path.exists(filepath):
@@ -178,6 +187,11 @@ class SmartDecoyGenerator:
         try:
             with open(filepath, 'rb') as f:
                 loaded_data = pickle.load(f)
+                first_key = next(iter(loaded_data))
+                if loaded_data[first_key] and len(loaded_data[first_key][0]) != 4:
+                    print("WARNING: Old pool format detected. Discarding and regenerating.")
+                    self.pool = defaultdict(list)
+                    return False
                 for k, v in loaded_data.items():
                     self.pool[k] = v
             print(f"Pool loaded. Total sequences: {sum(len(v) for v in self.pool.values())}")
@@ -197,7 +211,6 @@ class SmartDecoyGenerator:
             return
 
         print(f"Priming pool for {len(needed_lengths)} specific lengths...")
-        
         counts_total = {l: len(self.pool[l]) for l in needed_lengths}
         target_total = min_candidates
         max_total_gen = 50_000_000 
@@ -227,7 +240,7 @@ class SmartDecoyGenerator:
                     if l in needed_lengths:
                         pgen = self.calculate_pgen(cdr3, v, j)
                         if pgen > 0:
-                            self.pool[l].append((pgen, cdr3))
+                            self.pool[l].append((pgen, cdr3, v, j))
                             counts_total[l] += 1
                             total_added += 1
                             
@@ -251,8 +264,6 @@ class SmartDecoyGenerator:
             print(f"\n[!] Warning: {len(needed_lengths)} lengths still under-filled. Attempting targeted rescue...")
             for l in list(needed_lengths):
                 if len(self.pool[l]) > 0: continue 
-
-                print(f"   -> Forcing generation for length {l}...")
                 att = 0
                 while len(self.pool[l]) < 50 and att < 200000:
                     att += 1
@@ -263,23 +274,17 @@ class SmartDecoyGenerator:
                              v = item[2] if len(item) == 4 else item[1]
                              j = item[3] if len(item) == 4 else item[2]
                              pgen = self.calculate_pgen(cdr3, v, j)
-                             self.pool[l].append((pgen, cdr3))
+                             self.pool[l].append((pgen, cdr3, v, j))
 
         sys.stdout.write("\n")
         print(f"Finished. Total sequences in memory: {sum(len(v) for v in self.pool.values()):,}")
-        
         for l in self.pool:
             self.pool[l].sort(key=lambda x: x[0])       
 
     def find_pgen_matched_decoys(self, target_pgen, length, 
                                  n_decoys=5, 
                                  all_validated_seqs=set(), min_dist=2):
-        """
-        Returns: (list_of_decoys, failure_reason_string)
-        """
         candidates = self.pool[length]
-        
-        # Reason 1: No pool
         if not candidates: 
             return [], f"Pool empty for length {length}"
 
@@ -290,14 +295,13 @@ class SmartDecoyGenerator:
             val_log = math.log10(pgen_val)
             return abs(val_log - target_log)
 
-        # Sort by Pgen closeness
         sorted_candidates = sorted(candidates, key=lambda x: get_log_diff(x[0]))
         
         found_decoys = []
         filtered_count = 0
         
         # FIRST PASS: Strict Levenshtein
-        for pgen, seq in sorted_candidates:
+        for pgen, seq, v, j in sorted_candidates:
             if len(found_decoys) >= n_decoys: break
             if pgen <= 0: continue
             
@@ -312,38 +316,25 @@ class SmartDecoyGenerator:
                         break
             
             if not collision:
-                found_decoys.append((seq, pgen))
+                found_decoys.append((seq, pgen, v, j))
             else:
                 filtered_count += 1
 
-        # SECOND PASS (Fallback): Relax Levenshtein if needed
+        # SECOND PASS (Fallback)
         used_fallback = False
         if len(found_decoys) < n_decoys:
             needed = n_decoys - len(found_decoys)
             existing_seqs = set(x[0] for x in found_decoys)
-            
-            for pgen, seq in sorted_candidates:
+            for pgen, seq, v, j in sorted_candidates:
                 if len(found_decoys) >= n_decoys: break
                 if seq in existing_seqs: continue
-                if seq in all_validated_seqs: continue # Still reject exact real seqs
-                
-                found_decoys.append((seq, pgen))
+                if seq in all_validated_seqs: continue 
+                found_decoys.append((seq, pgen, v, j))
                 existing_seqs.add(seq)
                 used_fallback = True
 
-        # --- DIAGNOSE REASON ---
-        if len(found_decoys) == n_decoys:
-            if used_fallback:
-                 return found_decoys, "Filled using relaxed Levenshtein fallback"
-            else:
-                 return found_decoys, "Full"
-        else:
-            # We still don't have enough
-            total_avail = len(candidates)
-            if total_avail < n_decoys:
-                return found_decoys, f"Pool exhausted (only {total_avail} candidates existed)"
-            else:
-                return found_decoys, f"Filtered by validation set collision (rejected {filtered_count} candidates)"
+        status = "Filled (Relaxed)" if used_fallback else ("Full" if len(found_decoys)==n_decoys else "Partial/Empty")
+        return found_decoys, status
 
 def load_config(config_path):
     try:
@@ -361,7 +352,7 @@ def main():
     config = load_config(args.config)
     
     input_file = config.get('input_file')
-    output_file = config.get('output_file', 'decoys_output.csv')
+    output_file = config.get('output_file', 'decoys_output_long.csv')
     params = config.get('parameters', {})
     target_count = params.get('decoys_per_sequence', 5)
     
@@ -405,13 +396,11 @@ def main():
         generator.save_pool(args.pool_file)
     
     validated_seqs = set(df['junction_aa'].dropna().unique())
-    results = []
+    long_results = []
     L = params.get('levenshtein_distance_threshold', 1)
 
-    print("Finding 'best possible' matched decoys...")
+    print("Finding matched decoys and creating long-format output...")
     start_time = time.time()
-    
-    matches_count = 0
     total_targets = len(valid_indices)
 
     for i, real_idx in enumerate(valid_indices):
@@ -423,46 +412,50 @@ def main():
         
         target_pgen = generator.calculate_pgen(target_aa, meta['v'], meta['j'])
         
-        decoys, reason = generator.find_pgen_matched_decoys(
+        decoys, status = generator.find_pgen_matched_decoys(
             target_pgen, len(target_aa),
             n_decoys=target_count,
             all_validated_seqs=validated_seqs,
             min_dist=L + 1
         )
         
-        matches_count += len(decoys)
-        
-        # If no decoys found, log the failure reason
-        if not decoys:
-             results.append({
-                 'target_id': real_idx,
-                 'target_aa': target_aa,
-                 'target_pgen': target_pgen,
-                 'v_call': df.loc[real_idx, 'v_call'],
-                 'j_call': df.loc[real_idx, 'j_call'],
-                 'decoy_rank': None,
-                 'decoy_aa': None,
-                 'decoy_pgen': None,
-                 'pgen_diff_log10': None,
-                 'missing_reason': reason
-             })
-             continue
+        # 1. Add the "Test" (Real) Sequence Row
+        long_results.append({
+            'pair_id': real_idx,         # Links test to its decoys
+            'sequence_type': 'test',     # Explicit label
+            'rank': 0,                   # 0 = Real
+            'junction_aa': target_aa,
+            'v_call': df.loc[real_idx, 'v_call'],
+            'j_call': df.loc[real_idx, 'j_call'],
+            'pgen': target_pgen,
+            'log_pgen_diff': 0.0,
+            'status': 'Original'
+        })
 
-        for k, (d_seq, d_pgen) in enumerate(decoys):
-            results.append({
-                'target_id': real_idx,
-                'target_aa': target_aa,
-                'target_pgen': target_pgen,
-                'v_call': df.loc[real_idx, 'v_call'],
-                'j_call': df.loc[real_idx, 'j_call'],
-                'decoy_rank': k+1,
-                'decoy_aa': d_seq,
-                'decoy_pgen': d_pgen,
-                'pgen_diff_log10': abs(math.log10(d_pgen) - math.log10(target_pgen)) if target_pgen > 0 and d_pgen > 0 else None,
-                'missing_reason': reason if len(decoys) < target_count else "Full"
+        # 2. Add the "Control" (Decoy) Sequence Rows
+        for k, (d_seq, d_pgen, d_v_idx, d_j_idx) in enumerate(decoys):
+            diff = abs(math.log10(d_pgen) - math.log10(target_pgen)) if target_pgen > 0 and d_pgen > 0 else None
+            
+            long_results.append({
+                'pair_id': real_idx,
+                'sequence_type': 'control',
+                'rank': k + 1,
+                'junction_aa': d_seq,
+                'v_call': generator.get_gene_name(d_v_idx, 'V'),
+                'j_call': generator.get_gene_name(d_j_idx, 'J'),
+                'pgen': d_pgen,
+                'log_pgen_diff': diff,
+                'status': status
             })
 
-    pd.DataFrame(results).to_csv(output_file, index=False)
+    # Save to CSV
+    out_df = pd.DataFrame(long_results)
+    
+    # Clean Column Ordering
+    cols = ['pair_id', 'sequence_type', 'rank', 'junction_aa', 'v_call', 'j_call', 'pgen', 'log_pgen_diff', 'status']
+    out_df = out_df[cols]
+    
+    out_df.to_csv(output_file, index=False)
     print(f"\nDone. Saved to {output_file}. Total time: {time.time()-start_time:.2f}s")
 
 if __name__ == "__main__":

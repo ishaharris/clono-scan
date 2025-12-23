@@ -4,6 +4,7 @@ import random
 import pandas as pd
 import numpy as np
 import glob
+import sys
 from functools import partial
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -12,7 +13,6 @@ from rapidfuzz.process import cdist
 
 # -------------------------------------------------------------------------
 # GLOBAL VARIABLES FOR WORKERS
-# Using globals with an initializer prevents re-sending large data for every task.
 # -------------------------------------------------------------------------
 worker_hc_buckets = None
 worker_pair_data = None
@@ -22,9 +22,11 @@ def init_worker(hc_buckets, pair_data):
     global worker_hc_buckets, worker_pair_data
     worker_hc_buckets = hc_buckets
     worker_pair_data = pair_data
+    # TRACKING: Confirm the worker has actually started
+    print(f"  ⚙️  Worker process {os.getpid()} initialized.", flush=True)
 
 # -------------------------------------------------------------------------
-# 1) Config Loader
+# 1) Config Loader (Restored)
 # -------------------------------------------------------------------------
 def load_config(config_path="burden.yaml"):
     with open(config_path, "r") as f:
@@ -34,7 +36,7 @@ def load_config(config_path="burden.yaml"):
 # 2) Data Loader
 # -------------------------------------------------------------------------
 def load_matched_pairs(filepath):
-    print(f"📖 Loading matched sequences from {filepath}...")
+    print(f"📖 Loading matched sequences from {filepath}...", flush=True)
     try:
         sep = '\t' if filepath.endswith('.tsv') else ','
         df = pd.read_csv(filepath, sep=sep)
@@ -58,10 +60,10 @@ def load_matched_pairs(filepath):
                 pairs[pid]['controls'].append(seq)
         
         valid_pairs = {k: v for k, v in pairs.items() if v['test'] is not None}
-        print(f"✅ Loaded {len(valid_pairs)} valid pairs.")
+        print(f"✅ Loaded {len(valid_pairs)} valid pairs and {len(all_unique_seqs)} unique sequences.", flush=True)
         return valid_pairs, list(all_unique_seqs)
     except Exception as e:
-        print(f"❌ Error loading matched file: {e}")
+        print(f"❌ Error loading matched file: {e}", flush=True)
         raise
 
 # -------------------------------------------------------------------------
@@ -75,9 +77,6 @@ def process_patient_ratios(
     freq_col: str,
     max_distance: int
 ) -> tuple:
-    """
-    Processes a single file. Uses worker_hc_buckets from global scope.
-    """
     global worker_hc_buckets
     full_path = os.path.join(input_dir, relative_path)
     
@@ -94,17 +93,14 @@ def process_patient_ratios(
     found_freqs = defaultdict(float)
 
     try:
-        # 1. Load Data
         if full_path.endswith('.parquet'):
             rep = pd.read_parquet(full_path, columns=[seq_col, freq_col]).dropna()
         else:
             rep = pd.read_csv(full_path, sep=sep, usecols=[seq_col, freq_col], encoding='latin-1').dropna()
         
-        # 2. Collapse duplicates (biological abundance)
         collapsed = rep.groupby(seq_col)[freq_col].sum().reset_index()
         collapsed['len'] = collapsed[seq_col].str.len()
         
-        # 3. Block Processing by length
         for p_len, group in collapsed.groupby('len'):
             p_seqs = group[seq_col].tolist()
             p_weights = group[freq_col].to_numpy()
@@ -116,8 +112,6 @@ def process_patient_ratios(
             if not candidates:
                 continue
                 
-            # Vectorized distance calculation
-            # Note: workers=1 here because we are already inside a process pool.
             dist_matrix = cdist(p_seqs, candidates, scorer=L.distance, score_cutoff=max_distance, workers=1)
             
             rows, cols = np.where(dist_matrix <= max_distance)
@@ -126,7 +120,7 @@ def process_patient_ratios(
                 found_freqs[candidate_seq] += p_weights[r]
 
     except Exception as e:
-        print(f"⚠️ Failed on {full_path}: {e}")
+        print(f"⚠️ [Worker {os.getpid()}] Failed on {full_path}: {e}", flush=True)
         return patient_id, {}
 
     return patient_id, dict(found_freqs)
@@ -144,23 +138,21 @@ def main():
     hc_buckets = defaultdict(list)
     for seq in all_seqs:
         hc_buckets[len(seq)].append(seq)
-    hc_buckets = dict(hc_buckets) # Convert to standard dict for pickling
+    hc_buckets = dict(hc_buckets)
         
     search_pattern = os.path.join(paths['input_dir'], "**", "*.parquet")
     all_full_paths = glob.glob(search_pattern, recursive=True)
     file_names = [os.path.relpath(p, paths['input_dir']) for p in all_full_paths]
     
     if not file_names:
-        print(f"⚠️ No files found in {paths['input_dir']}!")
+        print(f"⚠️ No files found in {paths['input_dir']}!", flush=True)
         return
 
-    # Sampling logic
     if settings.get('sample_n') and settings['sample_n'] < len(file_names):
         random.seed(settings.get('random_seed', 42))
         file_names = random.sample(file_names, settings['sample_n'])
-        print(f"🎲 Sampling {len(file_names)} files.")
+        print(f"🎲 Sampling {len(file_names)} files.", flush=True)
 
-    # Partial function for non-global arguments
     worker_func = partial(
         process_patient_ratios,
         input_dir=paths['input_dir'],
@@ -174,16 +166,25 @@ def main():
     n_workers = settings.get('n_workers', 1)
     chunk_size = max(1, len(file_names) // (n_workers * 2))
 
-    print(f"🚀 Starting parallel pool with {n_workers} workers...")
+    print(f"🚀 Initializing Pool with {n_workers} workers...", flush=True)
     
-    # Process Pool with Initializer
+    processed_count = 0
+    total_files = len(file_names)
+
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=init_worker,
         initargs=(hc_buckets, pair_data)
     ) as exe:
-        # Map the worker function over the file list
-        for patient_id, freqs in exe.map(worker_func, file_names, chunksize=chunk_size):
+        results = exe.map(worker_func, file_names, chunksize=chunk_size)
+        
+        print(f"📥 Tasks assigned. Waiting for workers to start processing {total_files} files...", flush=True)
+        
+        for patient_id, freqs in results:
+            processed_count += 1
+            if processed_count % 1 == 0: # Print every file for now to catch the freeze
+                print(f"📈 Completed {processed_count}/{total_files}: {patient_id}", flush=True)
+            
             if not freqs: continue
             for seq, weight in freqs.items():
                 patient_counts[patient_id][seq] += weight
@@ -192,7 +193,7 @@ def main():
     final_results = []
     epsilon = float(calc['epsilon'])
 
-    print("📊 Calculating final ratios...")
+    print(f"📊 Calculations complete. Generating final ratios for {len(patient_counts)} patients...", flush=True)
     for patient_id, summed_freqs in patient_counts.items():
         for pid, data in pair_data.items():
             test_seq = data['test']
@@ -210,7 +211,7 @@ def main():
             })
 
     if final_results:
-        print("💾 Saving results...")
+        print("💾 Saving results...", flush=True)
         df_long = pd.DataFrame(final_results)
         matrix = df_long.pivot_table(
             index='hc_seq', 
@@ -219,9 +220,9 @@ def main():
         )
         os.makedirs(os.path.dirname(paths['output_file']), exist_ok=True)
         matrix.to_csv(paths['output_file'])
-        print(f"✅ Success! Saved to {paths['output_file']} | Shape: {matrix.shape}")
+        print(f"✅ Success! Saved to {paths['output_file']} | Shape: {matrix.shape}", flush=True)
     else:
-        print("❌ No results generated.")
+        print("❌ No results generated.", flush=True)
 
 if __name__ == '__main__':
     main()

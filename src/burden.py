@@ -64,7 +64,10 @@ def process_patient_ratios(
             .with_columns(pl.col(seq_col).str.len_chars().alias("len"))
         )
         
-        for p_len, group in collapsed.partition_by("len", as_dict=True).items():
+        for p_len_raw, group in collapsed.partition_by("len", as_dict=True).items():
+            # FIX: Ensure p_len is an integer
+            p_len = p_len_raw[0] if isinstance(p_len_raw, tuple) else p_len_raw
+            
             p_seqs = group[seq_col].to_list()
             p_weights = group[freq_col].to_numpy()
             

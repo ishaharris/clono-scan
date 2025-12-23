@@ -9,46 +9,21 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from rapidfuzz.distance import Levenshtein as L
 from rapidfuzz.process import cdist
-from tqdm import tqdm  # For a better progress bar
+from tqdm import tqdm
 
-# --- GLOBALS (To prevent IPC overhead/pickling) ---
+# --- GLOBALS (Placeholders) ---
 G_HC_BUCKETS = None
 G_PAIR_DATA = None
 
-# -------------------------------------------------------------------------
-# 1) Config & Data Loaders
-# -------------------------------------------------------------------------
-def load_config(config_path="burden.yaml"):
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-def load_matched_pairs(filepath):
-    print(f"📖 Loading matched sequences from {filepath}...")
-    # Use Polars for fast loading
-    df = pl.read_csv(filepath)
-    df.columns = [c.strip() for c in df.columns]
-    
-    pairs = defaultdict(lambda: {'test': None, 'controls': []})
-    all_unique_seqs = set()
-
-    for row in df.to_dicts():
-        pid = row['pair_id']
-        seq = row['junction_aa']
-        stype = row['sequence_type']
-        
-        if not seq or not isinstance(seq, str): continue
-        
-        all_unique_seqs.add(seq)
-        if stype == 'test':
-            pairs[pid]['test'] = seq
-        elif stype == 'control':
-            pairs[pid]['controls'].append(seq)
-    
-    valid_pairs = {k: v for k, v in pairs.items() if v['test'] is not None}
-    return valid_pairs, list(all_unique_seqs)
+# --- INITIALIZER (Required for macOS/Windows) ---
+def init_worker(buckets, pair_data):
+    """This function runs once when each worker process starts."""
+    global G_HC_BUCKETS, G_PAIR_DATA
+    G_HC_BUCKETS = buckets
+    G_PAIR_DATA = pair_data
 
 # -------------------------------------------------------------------------
-# 2) Optimized Worker
+# 1) Optimized Worker
 # -------------------------------------------------------------------------
 def process_patient_ratios(
     relative_path: str,
@@ -58,9 +33,12 @@ def process_patient_ratios(
     max_distance: int,
     epsilon: float
 ) -> tuple:
-    # Use Global data inherited from parent process (Copy-on-Write)
     global G_HC_BUCKETS, G_PAIR_DATA
     
+    # Debug: Check if globals exist
+    if G_HC_BUCKETS is None or G_PAIR_DATA is None:
+        return "error", None
+
     full_path = os.path.join(input_dir, relative_path)
     
     # Extract Patient ID
@@ -73,13 +51,12 @@ def process_patient_ratios(
     found_freqs = defaultdict(float)
 
     try:
-        # 1. Faster Reading & Pre-collapsing with Polars
+        # Load and Collapse
         if full_path.endswith('.parquet'):
             df = pl.read_parquet(full_path, columns=[seq_col, freq_col])
         else:
             df = pl.read_csv(full_path, columns=[seq_col, freq_col], ignore_errors=True)
         
-        # Collapse duplicates immediately
         collapsed = (
             df.drop_nulls()
             .group_by(seq_col)
@@ -87,78 +64,75 @@ def process_patient_ratios(
             .with_columns(pl.col(seq_col).str.len_chars().alias("len"))
         )
         
-        # 2. Block Processing by Length
         for p_len, group in collapsed.partition_by("len", as_dict=True).items():
             p_seqs = group[seq_col].to_list()
-            p_weights = group[freq_col].to_numpy() # shape (N,)
+            p_weights = group[freq_col].to_numpy()
             
-            # Find candidate controls within length threshold
             candidates = []
             for tgt_len in range(p_len - max_distance, p_len + max_distance + 1):
                 candidates.extend(G_HC_BUCKETS.get(tgt_len, []))
             
             if not candidates: continue
                 
-            # 3. Vectorized Distance + Weight Accumulation
-            # cdist is the bottleneck; limit workers=1 here because parent is multi-processed
             dist_matrix = cdist(p_seqs, candidates, scorer=L.distance, score_cutoff=max_distance, workers=1)
-            
-            # Create a boolean mask where distance is within threshold
             match_mask = (dist_matrix <= max_distance).astype(np.float32)
-            
-            # Vectorized Dot Product: Sum weights for each candidate
-            # (1 x N_patient_seqs) @ (N_patient_seqs x M_candidates) = (1 x M_candidates)
             summed_weights = p_weights @ match_mask
             
-            # Map back to global freq map
             for i, total_weight in enumerate(summed_weights):
                 if total_weight > 0:
                     found_freqs[candidates[i]] += total_weight
 
+        # Calculate Ratios
+        ratios = {}
+        for pid, data in G_PAIR_DATA.items():
+            test_val = found_freqs.get(data['test'], 0.0)
+            ctrl_sum = sum(found_freqs.get(c, 0.0) for c in data['controls'])
+            ctrl_avg = ctrl_sum / len(data['controls']) if data['controls'] else 0.0
+            ratios[data['test']] = (test_val + epsilon) / (ctrl_avg + epsilon)
+
+        return patient_id, ratios
+
     except Exception as e:
+        # Print actual error for debugging
+        print(f"Error in {relative_path}: {e}")
         return patient_id, None
 
-    # 4. Calculate Ratios
-    ratios = {}
-    for pid, data in G_PAIR_DATA.items():
-        test_val = found_freqs.get(data['test'], 0.0)
-        ctrl_sum = sum(found_freqs.get(c, 0.0) for c in data['controls'])
-        ctrl_avg = ctrl_sum / len(data['controls']) if data['controls'] else 0.0
-        
-        ratios[data['test']] = (test_val + epsilon) / (ctrl_avg + epsilon)
-
-    return patient_id, ratios
-
 # -------------------------------------------------------------------------
-# 3) Orchestrator
+# 2) Orchestrator
 # -------------------------------------------------------------------------
 def main():
-    global G_HC_BUCKETS, G_PAIR_DATA
+    with open("burden.yaml", "r") as f:
+        cfg = yaml.safe_load(f)
     
-    cfg = load_config("burden.yaml")
     paths, settings, calc = cfg['paths'], cfg['settings'], cfg['calculation']
     
-    # 1. Load reference pairs
-    pair_data, all_seqs = load_matched_pairs(paths['matched_sequences_file'])
+    # Load reference pairs
+    df_matched = pl.read_csv(paths['matched_sequences_file'])
+    df_matched.columns = [c.strip() for c in df_matched.columns]
     
-    # 2. Prepare Globals
+    pair_data = defaultdict(lambda: {'test': None, 'controls': []})
+    all_seqs = set()
+    for row in df_matched.to_dicts():
+        seq, pid, stype = row['junction_aa'], row['pair_id'], row['sequence_type']
+        if not seq: continue
+        all_seqs.add(seq)
+        if stype == 'test': pair_data[pid]['test'] = seq
+        elif stype == 'control': pair_data[pid]['controls'].append(seq)
+    
+    valid_pair_data = {k: v for k, v in pair_data.items() if v['test'] is not None}
     hc_buckets = defaultdict(list)
     for seq in all_seqs:
         hc_buckets[len(seq)].append(seq)
     
-    G_HC_BUCKETS = dict(hc_buckets)
-    G_PAIR_DATA = pair_data
-    
-    # 3. Collect files
+    # Collect files
     search_pattern = os.path.join(paths['input_dir'], "**", "*.parquet")
     file_names = [os.path.relpath(p, paths['input_dir']) for p in glob.glob(search_pattern, recursive=True)]
     
     if settings.get('sample_n') and settings['sample_n'] < len(file_names):
-        random.seed(42)
         file_names = random.sample(file_names, settings['sample_n'])
 
-    # 4. Setup Worker
-    worker = partial(
+    # Setup Worker
+    worker_func = partial(
         process_patient_ratios,
         input_dir=paths['input_dir'],
         seq_col=settings['seq_col'],
@@ -168,33 +142,34 @@ def main():
     )
 
     results = []
-    num_workers = settings['n_workers']
-    print(f"🚀 Processing {len(file_names)} files using {num_workers} workers...")
+    print(f"🚀 Starting processing {len(file_names)} files...")
 
-    # 5. Parallel Execution with tqdm progress bar
-    with ProcessPoolExecutor(max_workers=num_workers) as exe:
-        # Smaller chunksize (e.g., 10-20) ensures the progress bar updates frequently
-        mapper = exe.map(worker, file_names, chunksize=15)
+    # USE INITIALIZER HERE
+    # This sends the data once to each worker upon startup
+    with ProcessPoolExecutor(
+        max_workers=settings['n_workers'],
+        initializer=init_worker,
+        initargs=(dict(hc_buckets), valid_pair_data)
+    ) as exe:
+        mapper = exe.map(worker_func, file_names, chunksize=10)
         
         for patient_id, ratios in tqdm(mapper, total=len(file_names), desc="Progress"):
+            if patient_id == "error":
+                print("⚠️ Worker failed to initialize globals.")
+                continue
             if ratios is None: continue
             for seq, val in ratios.items():
                 results.append({'patient_id': patient_id, 'hc_seq': seq, 'ratio': val})
 
-    # 6. Save Matrix
     if results:
-        print("💾 Saving Results...")
+        print(f"💾 Saving {len(results)} rows to {paths['output_file']}...")
         df_out = pl.DataFrame(results)
-        # Polars pivot is extremely fast
-        matrix = df_out.pivot(
-            values="ratio",
-            index="hc_seq",
-            on="patient_id",
-            aggregate_function="mean"
-        )
+        matrix = df_out.pivot(values="ratio", index="hc_seq", on="patient_id", aggregate_function="mean")
         os.makedirs(os.path.dirname(paths['output_file']), exist_ok=True)
         matrix.write_csv(paths['output_file'])
-        print(f"✅ Success! Matrix shape: {matrix.shape}")
+        print(f"✅ Success! Saved to {paths['output_file']}")
+    else:
+        print("❌ No results generated! Check if column names in burden.yaml match your files.")
 
 if __name__ == '__main__':
     main()
